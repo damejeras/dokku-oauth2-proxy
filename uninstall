@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_AVAILABLE_PATH/oauth2-proxy/internal-functions"
+
+# Disable OAuth2 for all apps that have it enabled
+dokku_log_info1 "Disabling OAuth2 for all protected apps..."
+for app in $(dokku_apps); do
+  if fn-oauth2-enabled "$app"; then
+    dokku_log_verbose "Disabling OAuth2 for $app..."
+
+    # Remove nginx config
+    fn-oauth2-remove-nginx-config "$app"
+  fi
+done
+
+# Remove auth domain app
+dokku_log_info1 "Removing auth domain app..."
+fn-oauth2-remove-auth-domain-nginx
+
+dokku_log_info2 "OAuth2 proxy uninstalled"
+dokku_log_verbose "Plugin property data is preserved and can be manually removed from /var/lib/dokku/plugins/oauth2-proxy"

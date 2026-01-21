@@ -1,0 +1,4 @@
+[plugin]
+description = "OAuth2 authentication proxy for apps"
+version = "0.1.0"
+[plugin.config]

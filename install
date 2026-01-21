@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_AVAILABLE_PATH/oauth2-proxy/internal-functions"
+
+# Setup plugin property storage
+dokku_log_info1 "Initializing plugin storage..."
+fn-plugin-property-setup "oauth2-proxy"
+
+dokku_log_info1 "Initializing allowlist file..."
+fn-oauth2-ensure-allowed-emails-file
+
+dokku_log_info2 "Plugin installed successfully"
+dokku_log_verbose "Run 'dokku oauth2-proxy:setup' to configure OAuth2 authentication"

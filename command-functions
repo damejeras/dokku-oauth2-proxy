@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_AVAILABLE_PATH/oauth2-proxy/internal-functions"
+
+cmd-oauth2-setup() {
+  declare desc="Configure global OAuth2 settings"
+  declare cmd="oauth2-proxy:setup"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  local CLIENT_ID="$1"
+  local CLIENT_SECRET="$2"
+  local AUTH_DOMAIN="$3"
+
+  # Validation
+  if [[ -z "$CLIENT_ID" ]]; then
+    dokku_log_fail "Client ID required. Usage: dokku oauth2-proxy:setup <client-id> <client-secret> <auth-domain>"
+  fi
+
+  if [[ -z "$CLIENT_SECRET" ]]; then
+    dokku_log_fail "Client Secret required. Usage: dokku oauth2-proxy:setup <client-id> <client-secret> <auth-domain>"
+  fi
+
+  if [[ -z "$AUTH_DOMAIN" ]]; then
+    dokku_log_fail "Auth domain required (e.g., auth.example.com). Usage: dokku oauth2-proxy:setup <client-id> <client-secret> <auth-domain>"
+  fi
+
+  # Derive cookie domain from auth domain (e.g., auth.example.com -> .example.com)
+  local COOKIE_DOMAIN
+  COOKIE_DOMAIN=".$(echo "$AUTH_DOMAIN" | cut -d. -f2-)"
+  dokku_log_verbose "Derived cookie domain: $COOKIE_DOMAIN"
+
+  # Generate cookie secret if not exists
+  local COOKIE_SECRET
+  COOKIE_SECRET="$(fn-plugin-property-get "oauth2-proxy" "--global" "cookie-secret" "")"
+  if [[ -z "$COOKIE_SECRET" ]]; then
+    dokku_log_info1 "Generating cookie secret..."
+    COOKIE_SECRET="$(openssl rand -base64 32 | tr -- '+/' '-_')"
+  fi
+
+  # Store config
+  dokku_log_info1 "Storing OAuth2 configuration..."
+  fn-plugin-property-write "oauth2-proxy" "--global" "client-id" "$CLIENT_ID"
+  fn-plugin-property-write "oauth2-proxy" "--global" "client-secret" "$CLIENT_SECRET"
+  fn-plugin-property-write "oauth2-proxy" "--global" "cookie-secret" "$COOKIE_SECRET"
+  fn-plugin-property-write "oauth2-proxy" "--global" "cookie-domain" "$COOKIE_DOMAIN"
+  fn-plugin-property-write "oauth2-proxy" "--global" "auth-domain" "$AUTH_DOMAIN"
+
+  # Deploy oauth2-proxy as Dokku app
+  dokku_log_info1 "Deploying OAuth2 proxy app at $AUTH_DOMAIN..."
+  fn-oauth2-create-auth-domain-nginx "$AUTH_DOMAIN"
+
+  dokku_log_info2 "OAuth2 proxy configured successfully"
+  dokku_log_verbose "Auth domain: $AUTH_DOMAIN"
+  dokku_log_verbose "Cookie domain: $COOKIE_DOMAIN"
+  dokku_log_verbose "Google OAuth redirect URL: https://$AUTH_DOMAIN/oauth2/callback"
+  dokku_log_verbose "Allowlist file: $(fn-oauth2-allowed-emails-host-file)"
+  dokku_log_verbose "Use 'dokku oauth2-proxy:enable <app>' to protect an app"
+  dokku_log_verbose "To enable SSL: dokku letsencrypt:enable oauth2-proxy-auth"
+}
+
+cmd-oauth2-enable() {
+  declare desc="Enable OAuth2 authentication for an app"
+  declare cmd="oauth2-proxy:enable"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  local APP="$1"
+
+  if [[ -z "$APP" ]]; then
+    dokku_log_fail "App name required. Usage: dokku oauth2-proxy:enable <app>"
+  fi
+
+  verify_app_name "$APP"
+
+  # Check if OAuth2 proxy app is deployed
+  if ! dokku apps:exists "oauth2-proxy-auth" 2>/dev/null; then
+    dokku_log_fail "OAuth2 proxy not configured. Run 'dokku oauth2-proxy:setup' first."
+  fi
+
+  # Check if already enabled
+  if fn-oauth2-enabled "$APP"; then
+    dokku_log_fail "OAuth2 already enabled for $APP"
+  fi
+
+  dokku_log_info1 "Enabling OAuth2 for $APP..."
+
+  # Write nginx config
+  fn-oauth2-write-nginx-config "$APP"
+
+  dokku_log_info2 "OAuth2 enabled for $APP"
+  dokku_log_verbose "Users must authenticate with Google OAuth to access $APP"
+
+  local AUTH_DOMAIN
+  AUTH_DOMAIN="$(fn-plugin-property-get "oauth2-proxy" "--global" "auth-domain" "")"
+  dokku_log_verbose "Authentication URL: https://$AUTH_DOMAIN/oauth2/start?rd=<return-url>"
+}
+
+cmd-oauth2-disable() {
+  declare desc="Disable OAuth2 authentication for an app"
+  declare cmd="oauth2-proxy:disable"
+  [[ "$1" == "$cmd" ]] && shift 1
+
+  local APP="$1"
+
+  if [[ -z "$APP" ]]; then
+    dokku_log_fail "App name required. Usage: dokku oauth2-proxy:disable <app>"
+  fi
+
+  verify_app_name "$APP"
+
+  # Check if enabled
+  if ! fn-oauth2-enabled "$APP"; then
+    dokku_log_fail "OAuth2 not enabled for $APP"
+  fi
+
+  dokku_log_info1 "Disabling OAuth2 for $APP..."
+
+  # Remove nginx config
+  fn-oauth2-remove-nginx-config "$APP"
+
+  dokku_log_info2 "OAuth2 disabled for $APP"
+}
+

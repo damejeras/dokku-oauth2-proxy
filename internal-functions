@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+
+fn-oauth2-allowed-emails-host-file() {
+  echo "/var/lib/dokku/data/storage/oauth2-proxy/allowed_emails"
+}
+
+fn-oauth2-allowed-emails-container-file() {
+  echo "/etc/oauth2-proxy/allowed_emails"
+}
+
+fn-oauth2-ensure-allowed-emails-file() {
+  local ALLOWLIST_FILE
+  ALLOWLIST_FILE="$(fn-oauth2-allowed-emails-host-file)"
+  mkdir -p "$(dirname "$ALLOWLIST_FILE")"
+  touch "$ALLOWLIST_FILE"
+}
+
+
+fn-oauth2-enabled() {
+  # Check if OAuth2 is enabled for an app
+  declare desc="Check if OAuth2 is enabled for app"
+  local APP="$1"
+  local APP_ROOT="$DOKKU_ROOT/$APP"
+
+  [[ -f "$APP_ROOT/nginx.conf.d/oauth2.conf" ]]
+}
+
+fn-oauth2-write-nginx-config() {
+  # Generate and write nginx config for an app
+  declare desc="Generate and write nginx config for app"
+  local APP="$1"
+  local APP_ROOT="$DOKKU_ROOT/$APP"
+  local AUTH_DOMAIN
+
+  # Get auth domain (used for redirects)
+  AUTH_DOMAIN="$(fn-plugin-property-get "oauth2-proxy" "--global" "auth-domain" "")"
+
+
+  # Create nginx.conf.d directory if needed
+  mkdir -p "$APP_ROOT/nginx.conf.d"
+
+  # Render template
+  sigil -f "$PLUGIN_AVAILABLE_PATH/oauth2-proxy/templates/oauth2.conf.sigil" \
+    AUTH_DOMAIN="$AUTH_DOMAIN" \
+    > "$APP_ROOT/nginx.conf.d/oauth2.conf"
+
+  # Rebuild nginx config
+  dokku proxy:build-config "$APP"
+}
+
+fn-oauth2-remove-nginx-config() {
+  # Remove nginx config for an app
+  declare desc="Remove nginx config for app"
+  local APP="$1"
+  local APP_ROOT="$DOKKU_ROOT/$APP"
+
+  rm -f "$APP_ROOT/nginx.conf.d/oauth2.conf"
+
+  # Rebuild nginx config
+  dokku proxy:build-config "$APP"
+}
+
+fn-oauth2-create-auth-domain-nginx() {
+  # Deploy oauth2-proxy as a Dokku app
+  declare desc="Deploy oauth2-proxy as Dokku app for auth domain"
+  local AUTH_DOMAIN="$1"
+  local AUTH_APP_NAME="oauth2-proxy-auth"
+  local CLIENT_ID CLIENT_SECRET COOKIE_SECRET COOKIE_DOMAIN ALLOWLIST_HOST_FILE ALLOWLIST_CONTAINER_FILE
+
+  # Get OAuth2 config
+  CLIENT_ID="$(fn-plugin-property-get "oauth2-proxy" "--global" "client-id" "")"
+  CLIENT_SECRET="$(fn-plugin-property-get "oauth2-proxy" "--global" "client-secret" "")"
+  COOKIE_SECRET="$(fn-plugin-property-get "oauth2-proxy" "--global" "cookie-secret" "")"
+  COOKIE_DOMAIN="$(fn-plugin-property-get "oauth2-proxy" "--global" "cookie-domain" "")"
+
+  dokku_log_verbose "Setting up auth domain app: $AUTH_APP_NAME..."
+
+  fn-oauth2-ensure-allowed-emails-file
+  ALLOWLIST_HOST_FILE="$(fn-oauth2-allowed-emails-host-file)"
+  ALLOWLIST_CONTAINER_FILE="$(fn-oauth2-allowed-emails-container-file)"
+
+  # Create app if it doesn't exist
+  if ! dokku apps:exists "$AUTH_APP_NAME" 2>/dev/null; then
+    dokku_log_verbose "Creating Dokku app for auth domain..."
+    dokku apps:create "$AUTH_APP_NAME" >/dev/null
+  fi
+
+  # Set domain for the app
+  dokku_log_verbose "Configuring domain: $AUTH_DOMAIN..."
+  dokku domains:clear "$AUTH_APP_NAME" >/dev/null 2>&1 || true
+  dokku domains:add "$AUTH_APP_NAME" "$AUTH_DOMAIN" >/dev/null
+
+  # Mount allowlist file into the oauth2-proxy container
+  dokku_log_verbose "Configuring allowlist storage..."
+  dokku storage:mount "$AUTH_APP_NAME" "$ALLOWLIST_HOST_FILE:$ALLOWLIST_CONTAINER_FILE" >/dev/null 2>&1
+
+  # Configure environment variables for oauth2-proxy BEFORE deployment
+  dokku_log_verbose "Configuring environment variables..."
+  dokku config:set --no-restart "$AUTH_APP_NAME" \
+    PORT="4180" \
+    OAUTH2_PROXY_CLIENT_ID="$CLIENT_ID" \
+    OAUTH2_PROXY_CLIENT_SECRET="$CLIENT_SECRET" \
+    OAUTH2_PROXY_COOKIE_SECRET="$COOKIE_SECRET" \
+    OAUTH2_PROXY_COOKIE_DOMAINS="$COOKIE_DOMAIN" \
+    OAUTH2_PROXY_WHITELIST_DOMAINS="$COOKIE_DOMAIN" \
+    OAUTH2_PROXY_REDIRECT_URL="https://$AUTH_DOMAIN/oauth2/callback" \
+    OAUTH2_PROXY_UPSTREAMS="static://202" \
+    OAUTH2_PROXY_HTTP_ADDRESS="0.0.0.0:4180" \
+    OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE="$ALLOWLIST_CONTAINER_FILE" \
+    OAUTH2_PROXY_PROVIDER="google" \
+    OAUTH2_PROXY_REVERSE_PROXY="true" \
+    OAUTH2_PROXY_PASS_ACCESS_TOKEN="true" \
+    OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER="true" \
+    OAUTH2_PROXY_PASS_USER_HEADERS="true" \
+    OAUTH2_PROXY_SET_XAUTHREQUEST="true" \
+    OAUTH2_PROXY_SET_AUTHORIZATION_HEADER="true" \
+    OAUTH2_PROXY_COOKIE_SECURE="true" \
+    OAUTH2_PROXY_COOKIE_HTTPONLY="true"
+
+  # Set port mapping (oauth2-proxy listens on 4180, not 5000)
+  # Also bind to localhost:4180 for nginx auth_request access from host
+  dokku_log_verbose "Configuring port mapping..."
+  dokku ports:clear "$AUTH_APP_NAME" >/dev/null 2>&1 || true
+  dokku ports:set "$AUTH_APP_NAME" http:80:4180 https:443:4180 >/dev/null 2>&1
+  dokku docker-options:add "$AUTH_APP_NAME" deploy,run "-p 127.0.0.1:4180:4180" >/dev/null 2>&1
+
+  # Deploy oauth2-proxy image
+  dokku_log_verbose "Deploying oauth2-proxy Docker image..."
+  dokku git:from-image "$AUTH_APP_NAME" quay.io/oauth2-proxy/oauth2-proxy:latest >/dev/null 2>&1 || {
+    dokku_log_warn "Deployment failed. Check logs with: dokku logs $AUTH_APP_NAME"
+    return 1
+  }
+
+  dokku_log_info2 "Auth domain app created successfully"
+  dokku_log_verbose "OAuth2 authentication available at: https://$AUTH_DOMAIN/oauth2/"
+  dokku_log_verbose "To enable SSL: dokku letsencrypt:enable $AUTH_APP_NAME"
+}
+
+fn-oauth2-remove-auth-domain-nginx() {
+  # Remove Dokku app for auth domain
+  declare desc="Remove Dokku app for auth domain"
+  local AUTH_APP_NAME="oauth2-proxy-auth"
+
+  if dokku apps:exists "$AUTH_APP_NAME" 2>/dev/null; then
+    dokku_log_verbose "Removing auth domain app: $AUTH_APP_NAME..."
+    dokku --force apps:destroy "$AUTH_APP_NAME" >/dev/null 2>&1 || true
+    dokku_log_verbose "Removed auth domain app"
+  fi
+}

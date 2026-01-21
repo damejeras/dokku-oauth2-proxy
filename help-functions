@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+cmd-oauth2-help() {
+  declare desc="Show help for oauth2-proxy commands"
+
+  if [[ $1 = "oauth2-proxy:help" ]] ; then
+    echo -e 'Usage: dokku oauth2-proxy[:COMMAND]'
+    echo ''
+    echo 'Manage OAuth2 authentication for apps.'
+    echo ''
+    echo 'Additional commands:'
+    fn-oauth2-help-content | sort | column -c2 -t -s,
+  elif [[ $(ps -o command= $PPID) == *"--all"* ]]; then
+    fn-oauth2-help-content
+  else
+    cat<<help_desc
+    oauth2-proxy, Manage OAuth2 authentication for apps
+help_desc
+  fi
+}
+
+fn-oauth2-help-content() {
+  declare desc="help content"
+  cat<<help_content
+    oauth2-proxy:disable <app>, Disable OAuth2 authentication for an app
+    oauth2-proxy:enable <app>, Enable OAuth2 authentication for an app
+    oauth2-proxy:setup <client-id> <client-secret> <auth-domain>, Configure global OAuth2 settings and allowlist storage
+help_content
+}
